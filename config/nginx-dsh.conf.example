@@ -1,0 +1,62 @@
+# Nginx 反代 dsh —— 宿主上已经有 Nginx 在服务别的站点时用这份，
+# 不要再启动 docker-compose.caddy.yml（两者都要抢 80/443）。
+#
+# 安装：
+#   sudo cp config/nginx-dsh.conf.example /etc/nginx/conf.d/dsh.conf
+#   sudo vi /etc/nginx/conf.d/dsh.conf          # 把 dsh.example.com 换成你的域名
+#   # 先加下面那段 map 到 http 块（见「一次性前置」），再：
+#   sudo nginx -t && sudo systemctl reload nginx
+#   sudo certbot --nginx -d dsh.example.com     # 签证书，会自动改写本文件
+#
+# ============================================================
+# 一次性前置：WebSocket 的 map 必须放在 http 块里，不能放 server 块。
+# 如果 /etc/nginx/nginx.conf 的 http { } 里还没有这段，先加上：
+#
+#   map $http_upgrade $connection_upgrade {
+#       default upgrade;
+#       ''      close;
+#   }
+#
+# 为什么要 map 而不是直接写 `proxy_set_header Connection "upgrade"`：
+# 那样会给每个普通 HTTP 请求也带上升级头，部分上游会拒绝。map 的作用是
+# 只有客户端真的发了 Upgrade 时才回 upgrade，否则回 close。
+#
+# 别的站点已经配过这个 map 的话不要重复加，nginx -t 会报 duplicate。
+# ============================================================
+
+server {
+    listen 80;
+    listen [::]:80;
+    server_name dsh.example.com;
+
+    # certbot --nginx 会自己插入 301 跳转和 443 的 server 块。
+    # 在那之前保持 80 可用，ACME HTTP-01 挑战需要它。
+    location / {
+        proxy_pass http://127.0.0.1:3080;
+
+        proxy_http_version 1.1;
+        proxy_set_header Host              $host;
+        proxy_set_header X-Real-IP         $remote_addr;
+        proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+
+        # dsh 前端用 WebSocket 做实时通道，这三行缺一个都会让页面连上又断开
+        proxy_set_header Upgrade    $http_upgrade;
+        proxy_set_header Connection $connection_upgrade;
+
+        # 认证由 dsh 容器内的代理层做（PROXY_USERNAME / PROXY_PASSWORD），
+        # 这里不要再叠 auth_basic，同源两套 realm 只会让浏览器困惑。
+        # Authorization 头 Nginx 默认就会透传，不需要显式 proxy_set_header。
+
+        # 长连接不要被提前掐断。默认 60s 会让 WebSocket 每分钟断一次，
+        # 表现为「聊到一半就卡住 / 自动重连」。Nginx 不接受 0，给个大值。
+        proxy_read_timeout  86400s;
+        proxy_send_timeout  86400s;
+
+        # SSE / 流式输出不能被缓冲，否则模型输出会攒着一次性吐出来
+        proxy_buffering off;
+
+        # dsh 可以上传附件，默认 1m 太小
+        client_max_body_size 100m;
+    }
+}

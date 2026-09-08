@@ -1,0 +1,52 @@
+## 可选叠加：用 Caddy 终止 TLS，自动签发并续期 Let's Encrypt 证书。
+##
+## 只在宿主的 80/443 空着时才用得上。如果宿主上已经有 Nginx（或别的东西）占着
+## 这两个端口，用这个文件会撞 address already in use —— 那种情况走 Nginx 反代，
+## 见 config/nginx-dsh.conf.example，不需要本文件。
+##
+## 用法（注意要同时传两个 -f，顺序不能反）：
+##   docker compose -f docker-compose.prod.yml -f docker-compose.caddy.yml \
+##     --env-file .env.prod up -d
+##
+## 单独用 docker-compose.prod.yml 时 caddy 不存在，DSH_DOMAIN 和 ACME_EMAIL
+## 也就不是必填项 —— 这是把它拆出来的原因：compose 的 ${VAR:?} 插值在解析阶段
+## 就执行，跟 profiles 无关，写在主文件里会让走 Nginx 的人也被迫填这两个值。
+
+services:
+  caddy:
+    image: caddy:2.10-alpine
+    container_name: caddy-prod
+    restart: unless-stopped
+
+    depends_on:
+      # 只等容器起来，不等健康：Caddy 反代目标不可用时返回 502，
+      # 比它自己起不来更好排查
+      - dsh
+
+    environment:
+      # Caddyfile 里用 {$DSH_DOMAIN} / {$ACME_EMAIL} 读这两个值。
+      # 用 :? 强制必填：留空会让 Caddy 拿到空站点地址，行为是监听所有 host
+      # 且不申请证书，表现为「能开但一直是 HTTP」，比直接报错难查得多。
+      DSH_DOMAIN: ${DSH_DOMAIN:?用 Caddy 方案时必须在 .env.prod 设置 DSH_DOMAIN}
+      ACME_EMAIL: ${ACME_EMAIL:?用 Caddy 方案时必须在 .env.prod 设置 ACME_EMAIL}
+
+    ports:
+      - "80:80"
+      - "443:443"
+      # HTTP/3 走 UDP 443。不开不影响可用性，浏览器会回落到 TCP
+      - "443:443/udp"
+
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      # 必须持久化：证书和 ACME 账号私钥都存在 /data。不持久化的话每次重建容器
+      # 都会重新签发，而 Let's Encrypt 对同一组域名有每周 5 张的重复签发限制，
+      # 撞上了就得等一周，期间只能用 staging 证书或裸 HTTP。
+      # 这个目录含私钥，务必 chmod 700，别跟着代码一起备份到公开的地方。
+      - ${DATA_DIR}/caddy-data:/data:z
+      - ${DATA_DIR}/caddy-config:/config:z
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

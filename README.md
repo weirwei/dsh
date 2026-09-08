@@ -19,19 +19,26 @@ coding agent）和 [Hindsight](https://github.com/vectorize-io/hindsight)（给 
 
 ## 架构
 
+对外入口有两种选法，取决于宿主的 80/443 是否已经被占用：
+
 ```
-公网 ──443──> caddy ──> dsh:3080 ──> dsh:3079（容器内回环）
-                          │
-                          └──> hindsight:8888（仅容器网络内可达）
-                                    │
-                                    └──> pg0（嵌入式 Postgres）
+                 ┌─ A. 宿主已有 Nginx ─> nginx ──┐
+公网 ──80/443──> │                                ├─> 127.0.0.1:3080 ─> dsh:3079
+                 └─ B. 80/443 空着 ──> caddy ────┘        （容器内回环）
+                                                     │
+                                     dsh ──> hindsight:8888（仅容器网络内可达）
+                                                     │
+                                                     └─> pg0（嵌入式 Postgres）
 ```
 
-只有 Caddy 对公网开放。dsh 的 3080 和 hindsight 的 9999 都只绑宿主回环，
+A 用 `docker-compose.prod.yml` + `config/nginx-dsh.conf.example`，证书用 certbot 管。
+B 额外叠加 `docker-compose.caddy.yml`，证书由 Caddy 自动签发续期。
+
+两种方案下 dsh 都只绑宿主回环（`127.0.0.1:3080`），hindsight 的 9999 也一样，
 要访问得走 SSH 隧道。hindsight 的 8888 连宿主都不发布。
 
-四个容器：`caddy-prod`、`dsh-prod`、`dsh-prod-init`（一次性，跑完退出）、
-`hindsight-prod`。
+方案 A 三个容器：`dsh-prod`、`dsh-prod-init`（一次性，跑完退出）、`hindsight-prod`。
+方案 B 多一个 `caddy-prod`。
 
 ---
 
@@ -39,14 +46,18 @@ coding agent）和 [Hindsight](https://github.com/vectorize-io/hindsight)（给 
 
 ### 1. 前置条件
 
-四条全部满足再往下走，缺任何一条证书都签不下来：
-
 ```bash
 dig +short <你的域名>          # 结果要等于下一行
 curl -s ifconfig.me
 systemctl is-active firewalld  # 是 active 就放通 80/443
-ss -lntp | grep -E ':(80|443)\b'   # 确认没有别的进程占着
+sudo ss -lntp | grep -E ':(80|443)\b'   # 看这两个端口有没有被占
 ```
+
+最后一条决定走哪个方案 —— 不加 `sudo` 看不到进程名，容易误判：
+
+- **有输出** → 宿主上已经有 Web 服务（`sudo nginx -T | grep server_name` 看它在
+  服务什么）。走方案 A：Nginx 反代，不要启动 Caddy，两者会抢同一个端口。
+- **无输出** → 走方案 B：叠加 `docker-compose.caddy.yml`，证书自动管。
 
 还要在云控制台安全组放通 **TCP 80 和 443**。80 不能省，ACME HTTP-01 挑战和
 HTTP→HTTPS 跳转都走它。
@@ -104,16 +115,17 @@ cp .env.prod.example .env.prod
 chmod 600 .env.prod
 ```
 
-必填七项，漏任何一项 compose 会直接报错拒绝启动（而不是静默跑起来）：
+必填五项（方案 B 再加 `DSH_DOMAIN` 和 `ACME_EMAIL`，共七项），漏任何一项 compose
+会直接报错拒绝启动（而不是静默跑起来）：
 
 | 变量 | 说明 |
 |---|---|
-| `DSH_DOMAIN` | 域名，不带 `https://`、路径或端口 |
-| `ACME_EMAIL` | 证书到期通知邮箱 |
 | `DATA_DIR` | 上一步那个目录的绝对路径 |
 | `WORKSPACE_DIR` | 要让 dsh 操作的代码目录，宿主绝对路径 |
 | `PROXY_USERNAME` / `PROXY_PASSWORD` | dsh 的 Basic Auth，两个都设才启用，任一缺失代理层完全放行 |
 | `HINDSIGHT_API_TOKEN` | Hindsight 服务端 token，dsh 和控制台共用 |
+| `DSH_DOMAIN` | 仅方案 B。域名，不带 `https://`、路径或端口 |
+| `ACME_EMAIL` | 仅方案 B。证书到期通知邮箱 |
 
 生成随机值：`openssl rand -base64 24`（口令）、`openssl rand -hex 32`（token）。
 
@@ -132,8 +144,33 @@ docker compose -f docker-compose.prod.yml --env-file .env.prod up -d
 
 启动顺序由 `depends_on` 保证：`hindsight` 和 `dsh-init` 并行起（装插件不需要
 hindsight，没必要串行），两者都就绪后才起 `dsh`（等 hindsight 健康 + dsh-init
-成功退出），最后 `caddy`。首次启动 `hindsight` 要做 LLM 连通性校验，
+成功退出）。首次启动 `hindsight` 要做 LLM 连通性校验，
 `healthcheck.start_period` 给了 330s，慢是正常的。
+
+此时 dsh 只监听 `127.0.0.1:3080`，公网还进不来。接下来按方案二选一。
+
+#### 方案 A：宿主已有 Nginx
+
+```bash
+sudo cp config/nginx-dsh.conf.example /etc/nginx/conf.d/dsh.conf
+sudo vi /etc/nginx/conf.d/dsh.conf        # 换成你的域名
+sudo nginx -t && sudo systemctl reload nginx
+sudo certbot --nginx -d <你的域名>         # 签证书并自动改写上面那个文件
+```
+
+`nginx -t` 报 `unknown "connection_upgrade" variable` 是正常的第一次失败 ——
+WebSocket 需要的那段 `map` 必须放在 `nginx.conf` 的 `http` 块里，不能放在
+`server` 块。配置文件顶部注释里有原文，照抄进去（别的站点已经加过就不要重复加，
+会报 duplicate）。
+
+#### 方案 B：80/443 空着
+
+```bash
+docker compose -f docker-compose.prod.yml -f docker-compose.caddy.yml \
+  --env-file .env.prod up -d
+```
+
+两个 `-f` 都要传，顺序不能反。这时 `DSH_DOMAIN` 和 `ACME_EMAIL` 变成必填。
 
 ### 6. 验证
 
@@ -141,12 +178,12 @@ hindsight，没必要串行），两者都就绪后才起 `dsh`（等 hindsight 
 docker compose -f docker-compose.prod.yml --env-file .env.prod ps
 docker logs dsh-prod-init          # 看插件装了没
 docker logs hindsight-prod         # 确认没有 permission denied
-docker logs -f caddy-prod          # 等 certificate obtained successfully
+docker logs -f caddy-prod          # 方案 B：等 certificate obtained successfully
 curl -I https://<你的域名>          # 期望 401
 ```
 
-`401` 就是通的 —— 认证由 dsh 容器内的代理层做，Caddy 不叠第二层。浏览器打开会弹
-Basic Auth 登录框，用 `PROXY_USERNAME` / `PROXY_PASSWORD` 登录。
+`401` 就是通的 —— 认证由 dsh 容器内的代理层做，Nginx / Caddy 都不叠第二层。
+浏览器打开会弹 Basic Auth 登录框，用 `PROXY_USERNAME` / `PROXY_PASSWORD` 登录。
 
 ---
 
@@ -234,9 +271,17 @@ docker compose -f docker-compose.prod.yml --env-file .env.prod up -d
 **hindsight 报 permission denied** — `$DATA_DIR/hindsight-data` 的属主不是
 `1000:1000`。回到第 3 步。
 
-**证书签不下来** — Caddy 会反复重试并打日志。按第 1 步逐条查，尤其是备案和 80
-端口。注意 Let's Encrypt 对同一组域名有每周 5 张的重复签发限制，反复重建撞上了
-要等一周，所以 `caddy-data/` 千万别删。
+**证书签不下来** — 方案 B 下 Caddy 会反复重试并打日志。按第 1 步逐条查，尤其是
+备案和 80 端口。注意 Let's Encrypt 对同一组域名有每周 5 张的重复签发限制，反复
+重建撞上了要等一周，所以 `caddy-data/` 千万别删。
+
+**页面能开但对话中途卡住 / 反复重连（方案 A）** — Nginx 把 WebSocket 掐了。
+三个原因按可能性排序：`map $http_upgrade $connection_upgrade` 没加到 `http` 块、
+`proxy_read_timeout` 还是默认 60s、`proxy_buffering` 没关（流式输出会攒着一次性
+吐出来）。三项在 `config/nginx-dsh.conf.example` 里都有。
+
+**Caddy 起不来报 address already in use** — 宿主 80/443 被 Nginx 之类占着。
+你要的是方案 A，不要传 `-f docker-compose.caddy.yml`。
 
 **dsh 连不上 hindsight（401）** — 检查 `$DATA_DIR/hindsight-agent/` 下有没有
 残留的 `coding-agent.json`。插件的配置加载顺序是「先铺环境变量层，再让文件层
