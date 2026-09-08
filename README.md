@@ -211,6 +211,9 @@ docker restart dsh-prod
 
 已装的会被跳过，不会白等一轮网络请求。安装失败不阻塞 dsh 启动，只是插件没装上。
 
+在 Web UI 的插件市场里装插件时，提示「重启后生效」也一样用 `docker restart dsh-prod`
+—— UI 上那个「立即重启」按钮经反代访问会被拒，原因见下面排查一节。
+
 镜像本身不带 pnpm，只带 corepack，`init-plugins.sh` 会在需要时自动
 `corepack enable pnpm`。所以不要手工 `docker exec dsh-prod dsh plugin add ...`，
 那样会遇到 `pnpm not found on PATH`。
@@ -293,6 +296,25 @@ docker compose -f docker-compose.prod.yml --env-file .env.prod up -d
 残留的 `coding-agent.json`。插件的配置加载顺序是「先铺环境变量层，再让文件层
 覆盖它」，文件里的 `apiToken` 会静默压掉 `HINDSIGHT_API_TOKEN`，而报错只说 token
 被拒、不会告诉你它读的是文件那份。这套编排不需要那个文件，删掉即可。
+
+**Web UI 里点「立即重启」报 `restart is limited to same-origin loopback requests`**
+— 不是故障，是 dshmarket 的安全设计。它的 `lib/restart.js` 里 `trustedRestartRequest`
+要求三条同时成立：socket 远端是回环地址、**请求里不带任何转发头**
+（`Forwarded` / `X-Forwarded-For` / `X-Real-IP` 出现任一个就拒绝）、`Origin` 与
+`Host` 同源。经 Nginx 或 Caddy 访问必然踩中第二条 —— 那几个头是反代该加的，
+恰好也是这个接口用来识别「请求经过了代理」的信号。
+
+直接重启容器即可，效果完全等价（插件的「重启」就是重新 spawn dsh 进程，
+容器重启时 entrypoint 做的是同一件事）：
+
+```bash
+docker restart dsh-prod
+```
+
+装插件后提示「重启后生效」时都这么做。**不要为了让那个按钮能用去删 Nginx 里的
+`X-Real-IP` / `X-Forwarded-For`** —— 那会让 dsh 拿不到真实客户端 IP，也削弱了这个
+接口本来要防的东西（外部请求触发进程重启）。真想在 UI 里点，走 SSH 隧道从
+`http://127.0.0.1:3080` 访问，绕开反代就没有转发头了。
 
 **改了配置没生效** — `dsh` 的端口从公网收回之后，`http://<IP>:3080` 不再可用，
 这是有意的（Basic Auth 密码明文过网）。要临时恢复，把 compose 里 dsh 的

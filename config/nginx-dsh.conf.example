@@ -40,6 +40,13 @@ server {
         proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto $scheme;
 
+        # 上面两个转发头有个已知副作用：dshmarket 插件的「立即重启」按钮会失败，
+        # 报 restart is limited to same-origin loopback requests。它的
+        # trustedRestartRequest 把「带转发头」当作「请求经过了代理」的信号并拒绝，
+        # 这是有意的防护（外部请求不该能触发进程重启）。
+        # 不要为了让按钮能用删掉这两行——那样 dsh 就拿不到真实客户端 IP 了。
+        # 需要重启时用 docker restart dsh-prod，效果完全等价。
+
         # dsh 前端用 WebSocket 做实时通道，这三行缺一个都会让页面连上又断开
         proxy_set_header Upgrade    $http_upgrade;
         proxy_set_header Connection $connection_upgrade;
