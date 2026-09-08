@@ -1,0 +1,31 @@
+# Caddy 配置：TLS 终止 + 反代到 dsh。
+#
+# {$VAR} 语法读取的是 caddy 容器的环境变量，由 docker-compose.prod.yml 注入。
+# Caddy 会自动为 DSH_DOMAIN 申请并续期 Let's Encrypt 证书，前提是：
+#   - 域名 A/AAAA 记录已指向本机公网 IP
+#   - 80 和 443 都能从公网访问（80 用于 ACME HTTP-01 挑战与 HTTP→HTTPS 跳转）
+{
+	email {$ACME_EMAIL}
+}
+
+{$DSH_DOMAIN} {
+	encode zstd gzip
+
+	# 这里不再叠一层 Basic Auth：dsh 容器内的代理层已经做了认证
+	# （PROXY_USERNAME / PROXY_PASSWORD），同源上两套 realm 只会让浏览器困惑。
+	# Caddy 默认透传 Authorization 头，也自动处理 WebSocket 升级。
+	reverse_proxy dsh:3080 {
+		# dsh 前端用 WebSocket 做实时通道，长连接不要被提前掐断
+		transport http {
+			read_timeout 0
+		}
+	}
+
+	# 反代访问日志，排查扫描器和异常请求时用得上
+	log {
+		output file /data/access.log {
+			roll_size 10MiB
+			roll_keep 5
+		}
+	}
+}

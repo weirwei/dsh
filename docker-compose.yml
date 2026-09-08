@@ -1,0 +1,114 @@
+services:
+  hindsight:
+    image: ghcr.io/vectorize-io/hindsight:latest
+    container_name: hindsight
+    restart: unless-stopped
+
+    environment:
+      # 以下裸键（只有键名、没有值）的取值全部来自 .env，键名与 Hindsight 上游文档完全一致。
+      #
+      # 裸键的语义是「透传」：.env 里没写这一项时，该变量在容器里根本不会被设置，
+      # Hindsight 走它自己的默认值。写成 ${VAR} 形式则会注入空字符串，反而覆盖掉默认值。
+
+      # LLM：Hindsight 启动时会做一次连通性校验，API_KEY 缺失会直接退出。
+      # PROVIDER 默认 openai；MODEL 不填则用该 provider 的官方默认模型；
+      # BASE_URL 只在用 OpenAI 兼容端点（中转站 / Azure / vLLM / Ollama）时才需要填。
+      HINDSIGHT_API_LLM_PROVIDER:
+      HINDSIGHT_API_LLM_API_KEY:
+      HINDSIGHT_API_LLM_MODEL:
+      HINDSIGHT_API_LLM_BASE_URL:
+
+      # 模型输出 token 上限低于 65000 时必须下调此值，且它必须大于 chunk 大小（默认 3000）
+      HINDSIGHT_API_RETAIN_MAX_COMPLETION_TOKENS:
+
+      # 服务端鉴权：扩展与共享 key 需同时设置，客户端用 Authorization: Bearer <key>
+      # :? 是必填保护——.env 里漏掉 HINDSIGHT_API_TOKEN 时，compose 直接报错拒绝启动，
+      # 而不是注入空串让容器在启动期崩溃（那种失败形态与超时崩溃难以区分）
+      HINDSIGHT_API_TENANT_EXTENSION: hindsight_api.extensions.builtin.tenant:ApiKeyTenantExtension
+      HINDSIGHT_API_TENANT_API_KEY: ${HINDSIGHT_API_TOKEN:?请在 .env 中设置 HINDSIGHT_API_TOKEN}
+
+      # 内置控制台访问 API 时带的 token，不设则不发 Authorization 头，UI 数据接口全部 401
+      HINDSIGHT_CP_DATAPLANE_API_KEY: ${HINDSIGHT_API_TOKEN:?请在 .env 中设置 HINDSIGHT_API_TOKEN}
+      # 控制台 UI 自身的登录口令，不设则任何人可直接访问 9999
+      HINDSIGHT_CP_ACCESS_KEY:
+
+      # 启动初始化超时，覆盖 embedding 加载、cross-encoder 加载和 LLM 连通性校验。
+      # 最常见的卡点是 LLM 连通性校验（端点不可达 / base_url 写错），不是模型下载：
+      # 完整镜像已预置默认 embedding / reranker 模型，冷启动约 15s。
+      # 容器内部另有一个自杀阈值，取值为「本值 + 30s」，无需单独配置。
+      HINDSIGHT_API_MODEL_INIT_TIMEOUT:
+      # HuggingFace 下载源，仅在改用非默认的本地 embedding / reranker 模型时才有意义
+      HF_ENDPOINT:
+
+      # worker 身份默认取容器 hostname，重启后会变，导致中断的任务无人认领
+      HINDSIGHT_API_WORKER_ID: hindsight-dsh
+
+    expose:
+      - "8888"
+
+    ports:
+      # 控制台 UI 无内置鉴权，只绑本机回环，避免暴露到局域网
+      - "127.0.0.1:9999:9999"
+
+    volumes:
+      - hindsight-data:/home/hindsight/.pg0
+
+    # 嵌入式 pg0 关机时需要最多 30s 落盘 WAL，Docker 默认只给 10s 就 SIGKILL
+    stop_grace_period: 30s
+
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "curl -fsS http://localhost:8888/health || exit 1"
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      # 必须不小于容器内部的自杀阈值（= HINDSIGHT_API_MODEL_INIT_TIMEOUT + 30s，
+      # 默认 300 + 30 = 330s），否则 healthcheck 会早于容器自身超时判定 unhealthy。
+      # 在 .env 里调大 MODEL_INIT_TIMEOUT 时，这里要同步改。
+      start_period: 330s
+
+  dsh:
+    image: smanx/deepseek-harness:latest
+    container_name: dsh
+    restart: unless-stopped
+
+    depends_on:
+      hindsight:
+        condition: service_healthy
+
+    environment:
+      # 这三个键被 coding-agents 插件映射成 serverMode / apiUrl / apiToken
+      # （见插件 dist 里的 ENV_KEYS 表）。
+      #
+      # 这里曾经还挂过一个 config/coding-agent.json 并用 HINDSIGHT_CONFIG 指过去，
+      # 已经删掉，原因是插件的 loadConfig 顺序为：
+      #   applyLayer(applyLayer({}, 环境变量层), 文件层)
+      # 而 applyLayer 是 {...a, ...b}，**后者赢** —— 文件里的 apiToken 会静默
+      # 压掉这里的 HINDSIGHT_API_TOKEN。同一个密钥抄两份，改一处忘另一处就 401，
+      # 而且报错只说 token 被拒，不会告诉你它读的是文件那份。
+      #
+      # 删掉文件不需要额外处理：readRaw 对 ENOENT 静默返回空配置，
+      # 只有 JSON 语法坏了才会打 warning。远程那套 compose 一直是这么做的。
+      HINDSIGHT_SERVER_MODE: self-hosted
+      HINDSIGHT_API_URL: http://hindsight:8888
+      HINDSIGHT_API_TOKEN: ${HINDSIGHT_API_TOKEN:?请在 .env 中设置 HINDSIGHT_API_TOKEN}
+
+    ports:
+      # 容器内 dsh 只监听 127.0.0.1:3079，对外那层是 entrypoint.sh 里的 node 代理，
+      # 监听 0.0.0.0:3080。所以要发布的是 3080，发布 3079 永远连不上。
+      # 该代理自身不做认证（启动日志会打印"未启用认证"），因此只绑本机回环。
+      - "127.0.0.1:3080:3080"
+
+    volumes:
+      - dsh-home:/root/.dsh
+      # 用卷而不是挂单个只读文件：coding-agents 插件要往 ~/.hindsight/ 里写
+      # 运行时状态，只读的单文件挂载会让它装不上。和 prod 一套保持一致。
+      - hindsight-agent:/root/.hindsight
+
+volumes:
+  dsh-home:
+  hindsight-data:
+  hindsight-agent:

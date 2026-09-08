@@ -1,0 +1,291 @@
+## 远程服务器部署 —— 第二步：Caddy 终止 TLS，用域名访问
+##
+## 与本机版 docker-compose.yml 的差异只有六类，每一类都是必需的，不是优化：
+##
+##   1. 镜像换 slim。本机 11.7GB 内存无所谓，服务器只有 2GB：完整镜像的
+##      hindsight 实测占 895MB，slim 实测 517MB（含内嵌 pg0 和控制台）。
+##   2. slim 不带本地 embedding / reranker 模型，所以两者都用外部 provider：
+##      LLM 走 DeepSeek 直连，embedding 和 reranker 走硅基流动（当前免费）。
+##      这样既保住 slim 的内存优势，又拿到了真正的交叉编码器重排。
+##   3. dsh 开它自带的 Basic Auth。它的代理层默认「未启用认证」，而 dsh 能执行
+##      任意命令，一旦端口对外可达就等于把 shell 开放出去。
+##   4. 挂载代码目录。本机版没挂任何仓库，容器里的 dsh 无事可做。
+##   5. 多一个 dsh-init 一次性服务预装插件。本机的 dshmarket 是手工装的，
+##      远程 dsh-home 是另一个空卷，不预装就得每次重建后手工补。
+##   6. 多一个 caddy 服务终止 TLS 并反代到 dsh。
+##
+## 关于第 6 类，第一步（3080 直接对外）留下的问题是 Basic Auth 密码明文过网：
+## 任何能看到流量的人都能拿到密码，而 dsh 能执行任意命令。所以 dsh 现在不再
+## 对公网发布端口，只发布一个回环绑定用于 SSH 隧道排查，公网入口只有 Caddy。
+##
+## 上线前必须先具备的三件事，缺任何一件 ACME 签发都会失败：
+##   1. 域名 A 记录（有 IPv6 再加 AAAA）已指向本机公网 IP，且已生效
+##      验证：dig +short <域名>   结果应等于  curl -s ifconfig.me
+##   2. 云控制台安全组放通 TCP 80 和 443。80 不能省——ACME HTTP-01 挑战和
+##      HTTP→HTTPS 跳转都走它。
+##   3. 服务器本机防火墙也放通 80/443（OpenCloudOS 默认可能起了 firewalld）
+##      验证：systemctl is-active firewalld
+##
+## 启动前先准备数据目录（DATA_DIR 指向的位置，一次性）：
+##
+##   export D=/data/dsh                      # 换成你的 DATA_DIR
+##   sudo mkdir -p $D/{hindsight-data,hindsight-agent,dsh-home,caddy-data,caddy-config}
+##   sudo chown -R 1000:1000 $D/hindsight-data          # hindsight 以 uid 1000 跑
+##   sudo chown -R 0:0 $D/dsh-home $D/hindsight-agent $D/caddy-data $D/caddy-config
+##   sudo chmod 700 $D/dsh-home $D/caddy-data           # 含 credentials 与私钥
+##
+## 属主这步不能省。Docker 会自动创建缺失的 bind mount 目录，但属主是 root:root，
+## 而 hindsight 容器以 uid 1000 运行，拿不到写权限，pg0 会在启动期失败，
+## 报的是权限错误、看起来像配置问题。
+##
+## SELinux 系统（OpenCloudOS / RHEL 系默认可能是 Enforcing）：挂载点都带了 :z
+## 后缀让 Docker 自动打共享标签。用 :z 而不是 :Z，因为 dsh-home 和
+## hindsight-agent 同时被 dsh 和 dsh-init 两个容器挂载，:Z 的独占标签会让
+## 后挂的那个读不到。非 SELinux 系统会忽略这个后缀，不影响。
+##   检查：getenforce
+##
+## 从旧的命名卷迁移（之前 up 过、数据在 dsh-prod_* 卷里时才需要）：
+##   docker compose -f docker-compose.prod.yml --env-file .env.prod down
+##   for v in dsh-home hindsight-data hindsight-agent; do
+##     docker run --rm -v dsh-prod_$v:/from -v $D/$v:/to alpine \
+##       sh -c 'cd /from && cp -a . /to/ 2>/dev/null || true'
+##   done
+##   # 拷完再执行一遍上面那两行 chown，然后 up -d，确认无误后才删旧卷
+##
+## 启动：docker compose -f docker-compose.prod.yml --env-file .env.prod up -d
+
+# 独立项目名，避免在本机误跑时顶替掉现有的 dsh 栈并复用它的数据卷
+name: dsh-prod
+
+services:
+  hindsight:
+    image: ghcr.io/vectorize-io/hindsight:latest-slim
+    container_name: hindsight-prod
+    restart: unless-stopped
+
+    environment:
+      # 裸键（只有键名没有值）= 从 .env.prod 透传；.env.prod 里没写的键在容器内
+      # 完全不会被设置，走 Hindsight 自己的默认值。
+      # 千万不要在 .env.prod 里写「KEY=」留空，原因见 .env.prod.example 头部。
+
+      # ---- LLM ----
+      HINDSIGHT_API_LLM_PROVIDER:
+      HINDSIGHT_API_LLM_API_KEY:
+      HINDSIGHT_API_LLM_MODEL:
+      HINDSIGHT_API_LLM_BASE_URL:
+
+      # ---- Embedding（slim 必需）----
+      # 走硅基流动的 OpenAI 兼容端点，模型 BAAI/bge-m3（多语言，中文语料上明显
+      # 强于 text-embedding-3-large），官网当前对该模型免费。
+      # 注意 bge-m3 输出维度固定 1024，不吃 dimensions 参数，所以 .env.prod 里
+      # DIMENSIONS 那行必须保持注释。维度会写进数据库 schema，事后改要重新 embed。
+      HINDSIGHT_API_EMBEDDINGS_PROVIDER: openai
+      HINDSIGHT_API_EMBEDDINGS_OPENAI_API_KEY:
+      HINDSIGHT_API_EMBEDDINGS_OPENAI_BASE_URL:
+      HINDSIGHT_API_EMBEDDINGS_OPENAI_MODEL:
+      HINDSIGHT_API_EMBEDDINGS_OPENAI_DIMENSIONS:
+      # 一次 embeddings 请求塞多少条输入，默认 100。免费档撞限流时往下调。
+      HINDSIGHT_API_EMBEDDINGS_OPENAI_BATCH_SIZE:
+
+      # ---- Reranker ----
+      # 用硅基流动的原生 provider，模型 BAAI/bge-reranker-v2-m3（官网当前免费）。
+      # 跑在对方服务器上，本地零内存开销，却拿到了真正的交叉编码器重排——
+      # 比 rrf（完全不做神经重排）召回质量好一截，也不用为此换完整镜像多吃 378MB。
+      HINDSIGHT_API_RERANKER_PROVIDER: siliconflow
+      HINDSIGHT_API_RERANKER_SILICONFLOW_API_KEY:
+      HINDSIGHT_API_RERANKER_SILICONFLOW_MODEL:
+
+      # ---- 数据库 ----
+      # 用内嵌的 pg0，已实测 slim + pg0 能正常起来并跑完 migration。
+      # 官方对 pg0 的说法是 not recommended for production，实际影响是它随记忆量
+      # 和索引增长，且容器被 OOM 杀掉时可能损坏。要换外部 Postgres（需 pgvector）
+      # 时在 .env.prod 里填 HINDSIGHT_API_DATABASE_URL 即可，不用改这里。
+      HINDSIGHT_API_DATABASE_URL:
+
+      # ---- 鉴权 ----
+      HINDSIGHT_API_TENANT_EXTENSION: hindsight_api.extensions.builtin.tenant:ApiKeyTenantExtension
+      HINDSIGHT_API_TENANT_API_KEY: ${HINDSIGHT_API_TOKEN:?请在 .env.prod 中设置 HINDSIGHT_API_TOKEN}
+      HINDSIGHT_CP_DATAPLANE_API_KEY: ${HINDSIGHT_API_TOKEN:?请在 .env.prod 中设置 HINDSIGHT_API_TOKEN}
+      HINDSIGHT_CP_ACCESS_KEY:
+
+      HINDSIGHT_API_MODEL_INIT_TIMEOUT:
+      HINDSIGHT_API_WORKER_ID: hindsight-dsh
+
+    expose:
+      - "8888"
+
+    ports:
+      # 控制台只绑回环，不上公网。要看时用 SSH 隧道：
+      #   ssh -N -L 9999:127.0.0.1:9999 <user>@<server>
+      # 然后本地浏览器开 http://127.0.0.1:9999
+      - "127.0.0.1:9999:9999"
+
+    volumes:
+      # pg0 的数据库文件。hindsight 容器以 uid 1000 运行（镜像里的 hindsight
+      # 用户），而 Docker 自动创建的 bind mount 目录属主是 root:root——
+      # 不先 chown 1000:1000 的话 pg0 起不来，报的是权限错误而不是配置错误。
+      # 目录准备命令见本文件顶部注释。
+      - ${DATA_DIR:?请在 .env.prod 中设置 DATA_DIR（宿主绝对路径，如 /data/dsh）}/hindsight-data:/home/hindsight/.pg0:z
+
+    # 内嵌 pg0 关机时需要最多 30s 落盘 WAL，Docker 默认只给 10s 就 SIGKILL
+    stop_grace_period: 30s
+
+    # hindsight 每 30s 打一条 WORKER_STATS，小盘机器不限制会被日志填满
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "curl -fsS http://localhost:8888/health || exit 1"
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      # 不小于容器内部自杀阈值（MODEL_INIT_TIMEOUT + 30s，默认 330s）。
+      # slim 没有本地模型要加载，这段时间主要花在 LLM 连通性校验上。
+      start_period: 330s
+
+  # 一次性插件预装。跑完就退出，不常驻。
+  # 它和 dsh 共享 dsh-home 卷，安装产物落在卷里的 profiles/web/，所以「装」和
+  # 「用」可以分在两个容器：dsh 服务的 entrypoint 不用被覆盖，dsh 容器里也不需要
+  # 有 pnpm。详见 config/init-plugins.sh 顶部注释。
+  dsh-init:
+    image: smanx/deepseek-harness:latest
+    container_name: dsh-prod-init
+    # one-shot：正常退出就别再拉起来，否则会和 dsh 反复抢同一个 profile 目录
+    restart: "no"
+    entrypoint: ["/bin/sh", "/init-plugins.sh"]
+
+    environment:
+      # 要预装的插件，空格分隔，pnpm spec 语法（可带 @版本）。
+      #
+      # 默认两个：
+      #   dshmarket                              插件市场，装完其余插件在 UI 里点
+      #   @vectorize-io/hindsight-coding-agents  接本栈自带的 hindsight 长期记忆
+      #     （对应 github.com/vectorize-io/hindsight 的
+      #      hindsight-integrations/coding-agents 目录，走 npm 装比整仓 clone 快）
+      #
+      # 这个包没有 postinstall/prepare 脚本，安装期不写任何配置；它连
+      # hindsight 用的 serverMode/apiUrl/apiToken 全部来自 dsh 服务上那三个
+      # HINDSIGHT_* 环境变量，不需要配置文件。
+      DSH_PLUGINS: ${DSH_PLUGINS:-dshmarket @vectorize-io/hindsight-coding-agents}
+      # corepack 下载 pnpm 前会交互式确认，非交互容器里会挂住
+      COREPACK_ENABLE_DOWNLOAD_PROMPT: "0"
+      # 裸键透传：国内机器走 registry.npmjs.org 可能很慢甚至超时，那就在
+      # .env.prod 里设 COREPACK_NPM_REGISTRY 和 npm_config_registry 换镜像源。
+      # 写成 ${VAR} 会注入空串，反而把 corepack/pnpm 的默认源覆盖掉。
+      COREPACK_NPM_REGISTRY:
+      npm_config_registry:
+
+    volumes:
+      - ${DATA_DIR}/dsh-home:/root/.dsh:z
+      # 和 dsh 服务挂同一个目录。当前版本的 coding-agents 插件在安装期不写这里
+      # （package.json 没有 postinstall/prepare），挂上是为了将来某个版本真的
+      # 在安装期落配置时不会写进一次性容器的可写层然后随容器一起消失。
+      - ${DATA_DIR}/hindsight-agent:/root/.hindsight:z
+      # 脚本只读挂载没问题——它自己不需要被写。注意别把 profiles/ 里的
+      # package.json 这类文件也这么挂，那些要可写
+      - ./config/init-plugins.sh:/init-plugins.sh:ro
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  dsh:
+    image: smanx/deepseek-harness:latest
+    container_name: dsh-prod
+    restart: unless-stopped
+
+    depends_on:
+      hindsight:
+        condition: service_healthy
+      # 预装脚本恒定 exit 0，所以装失败也不会卡住 dsh 启动，只是插件没装上
+      dsh-init:
+        condition: service_completed_successfully
+
+    environment:
+      HINDSIGHT_SERVER_MODE: self-hosted
+      HINDSIGHT_API_URL: http://hindsight:8888
+      HINDSIGHT_API_TOKEN: ${HINDSIGHT_API_TOKEN:?请在 .env.prod 中设置 HINDSIGHT_API_TOKEN}
+
+      # dsh 自带代理层的 Basic Auth：两个都设才启用，任一缺失就完全放行。
+      # 这是端口对外可达时唯一的一道门，所以用 :? 强制必填。
+      PROXY_USERNAME: ${PROXY_USERNAME:?请在 .env.prod 中设置 PROXY_USERNAME}
+      PROXY_PASSWORD: ${PROXY_PASSWORD:?请在 .env.prod 中设置 PROXY_PASSWORD}
+
+    ports:
+      # 容器内 dsh 只监听 127.0.0.1:3079，对外那层是 entrypoint.sh 起的 node
+      # 代理，监听 0.0.0.0:3080。要连的是 3080，3079 永远连不上。
+      #
+      # 第二步起公网入口只有 Caddy，这里只保留回环绑定用于排查（绕过 Caddy 看
+      # 问题出在哪一层）。访问方式和 hindsight 控制台一样走 SSH 隧道：
+      #   ssh -N -L 3080:127.0.0.1:3080 <user>@<server>
+      # 想改回「IP:3080 直连」只需把左边的 127.0.0.1: 去掉，但那样密码明文过网。
+      - "127.0.0.1:3080:3080"
+
+    # Caddy 在同一个 compose 网络里用服务名 dsh 访问这个端口，不需要发布到宿主
+    expose:
+      - "3080"
+
+    volumes:
+      # 会话历史、已装插件、profile、.credentials.yaml 全在这里，是最该备份的
+      # 一份。dsh 容器以 root 运行，所以这个目录保持 root 属主、权限 700。
+      - ${DATA_DIR}/dsh-home:/root/.dsh:z
+      # 用目录而不是只挂单个文件：hindsight 的 coding-agents 插件要往
+      # ~/.hindsight/ 里写运行时和配置，只读的单文件挂载会让它装不上
+      - ${DATA_DIR}/hindsight-agent:/root/.hindsight:z
+      # 要让 dsh 操作的代码目录，必须是宿主上的绝对路径
+      - ${WORKSPACE_DIR:?请在 .env.prod 中设置 WORKSPACE_DIR（宿主绝对路径）}:/workspace
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # 公网唯一入口：终止 TLS，反代到 dsh。配置在同目录的 Caddyfile 里。
+  # Caddy 自动申请并续期 Let's Encrypt 证书，不需要手工跑 certbot。
+  caddy:
+    image: caddy:2.10-alpine
+    container_name: caddy-prod
+    restart: unless-stopped
+
+    depends_on:
+      # 只等容器起来，不等健康：Caddy 反代目标不可用时返回 502，
+      # 比它自己起不来更好排查
+      - dsh
+
+    environment:
+      # Caddyfile 里用 {$DSH_DOMAIN} / {$ACME_EMAIL} 读这两个值。
+      # 用 :? 强制必填：留空会让 Caddy 拿到空站点地址，行为是监听所有 host
+      # 且不申请证书，表现为「能开但一直是 HTTP」，比直接报错难查得多。
+      DSH_DOMAIN: ${DSH_DOMAIN:?请在 .env.prod 中设置 DSH_DOMAIN（如 dsh.example.com）}
+      ACME_EMAIL: ${ACME_EMAIL:?请在 .env.prod 中设置 ACME_EMAIL（证书到期通知邮箱）}
+
+    ports:
+      - "80:80"
+      - "443:443"
+      # HTTP/3 走 UDP 443。不开不影响可用性，浏览器会回落到 TCP
+      - "443:443/udp"
+
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      # 必须持久化：证书和 ACME 账号私钥都存在 /data。不持久化的话每次重建容器
+      # 都会重新签发，而 Let's Encrypt 对同一组域名有每周 5 张的重复签发限制，
+      # 撞上了就得等一周，期间只能用 staging 证书或裸 HTTP。
+      # 这个目录含私钥，务必 chmod 700，别跟着代码一起备份到公开的地方。
+      - ${DATA_DIR}/caddy-data:/data:z
+      - ${DATA_DIR}/caddy-config:/config:z
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

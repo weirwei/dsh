@@ -1,0 +1,24 @@
+# 环境变量文件含 API key、token、口令，一律不入库
+.env
+.env.prod
+.env.*
+# 模板必须显式放行：上面的 .env.* 会连 .env.example 一起吃掉，
+# 漏了这两行的话新建模板不会报错，只是 git status 里永远看不见它。
+!.env.example
+!.env.prod.example
+
+# 本机版曾经挂载的插件配置，含 apiToken。
+# 两套 compose 现在都改成纯环境变量（HINDSIGHT_API_TOKEN），不再需要这个文件。
+# 规则保留是为了兜住旧仓库里的残留：插件仍会读 ~/.hindsight/coding-agent.json，
+# 且文件层优先级高于环境变量，残留文件会静默压掉 .env 里的 token。
+config/coding-agent.json
+
+# Caddy 签发的证书与 ACME 账号私钥
+caddy-data/
+caddy-config/
+
+# IDE 配置，因人因机而异
+.idea/
+
+# macOS
+.DS_Store
