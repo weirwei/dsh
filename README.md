@@ -115,21 +115,27 @@ cp .env.prod.example .env.prod
 chmod 600 .env.prod
 ```
 
-必填五项（方案 B 再加 `DSH_DOMAIN` 和 `ACME_EMAIL`，共七项），漏任何一项 compose
-会直接报错拒绝启动（而不是静默跑起来）：
+必填八项（方案 B 再加 `DSH_DOMAIN` 和 `ACME_EMAIL`），漏任何一项 compose 会直接
+报错拒绝启动，错误信息里带中文提示，不会静默跑起来：
 
-| 变量 | 说明 |
-|---|---|
-| `DATA_DIR` | 上一步那个目录的绝对路径 |
-| `WORKSPACE_DIR` | 要让 dsh 操作的代码目录，宿主绝对路径 |
-| `PROXY_USERNAME` / `PROXY_PASSWORD` | dsh 的 Basic Auth，两个都设才启用，任一缺失代理层完全放行 |
-| `HINDSIGHT_API_TOKEN` | Hindsight 服务端 token，dsh 和控制台共用 |
-| `DSH_DOMAIN` | 仅方案 B。域名，不带 `https://`、路径或端口 |
-| `ACME_EMAIL` | 仅方案 B。证书到期通知邮箱 |
+| 变量 | 说明 | 去哪拿 |
+|---|---|---|
+| `DATA_DIR` | 上一步那个目录的绝对路径 | — |
+| `WORKSPACE_DIR` | 要让 dsh 操作的代码目录，宿主绝对路径 | — |
+| `PROXY_USERNAME` | dsh 的 Basic Auth 用户名 | `openssl rand -base64 24` |
+| `PROXY_PASSWORD` | dsh 的 Basic Auth 口令，和上一项都设才启用，任一缺失代理层完全放行 | 同上 |
+| `HINDSIGHT_API_TOKEN` | Hindsight 服务端 token，dsh 和控制台共用 | `openssl rand -hex 32` |
+| `HINDSIGHT_API_LLM_API_KEY` | Hindsight 做记忆抽取和反思要调 LLM | platform.deepseek.com |
+| `HINDSIGHT_API_EMBEDDINGS_OPENAI_API_KEY` | slim 镜像不带本地 embedding 模型，必须用外部 provider | cloud.siliconflow.cn |
+| `HINDSIGHT_API_RERANKER_SILICONFLOW_API_KEY` | 重排模型，和上一项填同一个 key | 同上 |
+
+后两项当前在硅基流动是免费的（`BAAI/bge-m3` 和 `BAAI/bge-reranker-v2-m3`），
+注册就能用。三个 key 缺任何一个，Hindsight 会在启动期直接崩溃退出而不是降级运行。
+
+`DSH_DOMAIN`（域名，不带 `https://`、路径或端口）和 `ACME_EMAIL`（证书到期通知
+邮箱）只有方案 B 需要，方案 A 保持注释状态。
 
 生成随机值：`openssl rand -base64 24`（口令）、`openssl rand -hex 32`（token）。
-
-还有 LLM 和 embedding 的 key 要填，见 `.env.prod.example` 里的说明。
 
 有一条贯穿整个文件的规则：**不需要的项保持注释状态，不要写成 `KEY=` 留空。**
 留空会往容器里注入空字符串，而 Hindsight 各处读环境变量的写法不统一，后果不同

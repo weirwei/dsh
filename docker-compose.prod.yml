@@ -70,7 +70,10 @@ services:
 
       # ---- LLM ----
       HINDSIGHT_API_LLM_PROVIDER:
-      HINDSIGHT_API_LLM_API_KEY:
+      # 这个键不用裸键透传而是 :? 必填：它没有「不设置就走默认」的语义，
+      # 缺了容器一定崩（MemoryEngine 构造函数直接 raise ValueError）。
+      # 让 compose 在启动前就拦住，比起来之后翻崩溃日志省事得多。
+      HINDSIGHT_API_LLM_API_KEY: ${HINDSIGHT_API_LLM_API_KEY:?请在 .env.prod 中设置 HINDSIGHT_API_LLM_API_KEY（LLM 的 API key）}
       HINDSIGHT_API_LLM_MODEL:
       HINDSIGHT_API_LLM_BASE_URL:
 
@@ -80,7 +83,9 @@ services:
       # 注意 bge-m3 输出维度固定 1024，不吃 dimensions 参数，所以 .env.prod 里
       # DIMENSIONS 那行必须保持注释。维度会写进数据库 schema，事后改要重新 embed。
       HINDSIGHT_API_EMBEDDINGS_PROVIDER: openai
-      HINDSIGHT_API_EMBEDDINGS_OPENAI_API_KEY:
+      # 同样用 :? 必填：PROVIDER 已在上面硬编码成 openai，而 slim 镜像不带
+      # 本地 embedding 模型，所以这个 key 没有「可以不填」的选项。
+      HINDSIGHT_API_EMBEDDINGS_OPENAI_API_KEY: ${HINDSIGHT_API_EMBEDDINGS_OPENAI_API_KEY:?请在 .env.prod 中设置 HINDSIGHT_API_EMBEDDINGS_OPENAI_API_KEY（硅基流动的 key）}
       HINDSIGHT_API_EMBEDDINGS_OPENAI_BASE_URL:
       HINDSIGHT_API_EMBEDDINGS_OPENAI_MODEL:
       HINDSIGHT_API_EMBEDDINGS_OPENAI_DIMENSIONS:
@@ -92,7 +97,9 @@ services:
       # 跑在对方服务器上，本地零内存开销，却拿到了真正的交叉编码器重排——
       # 比 rrf（完全不做神经重排）召回质量好一截，也不用为此换完整镜像多吃 378MB。
       HINDSIGHT_API_RERANKER_PROVIDER: siliconflow
-      HINDSIGHT_API_RERANKER_SILICONFLOW_API_KEY:
+      # 同上：PROVIDER 硬编码 siliconflow，key 必须有。
+      # 和 embedding 那个填同一个硅基流动的 key。
+      HINDSIGHT_API_RERANKER_SILICONFLOW_API_KEY: ${HINDSIGHT_API_RERANKER_SILICONFLOW_API_KEY:?请在 .env.prod 中设置 HINDSIGHT_API_RERANKER_SILICONFLOW_API_KEY（与 embedding 同一个硅基流动 key）}
       HINDSIGHT_API_RERANKER_SILICONFLOW_MODEL:
 
       # ---- 数据库 ----
