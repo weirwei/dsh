@@ -162,7 +162,9 @@ services:
   # 「用」可以分在两个容器：dsh 服务的 entrypoint 不用被覆盖，dsh 容器里也不需要
   # 有 pnpm。详见 config/init-plugins.sh 顶部注释。
   dsh-init:
-    image: smanx/deepseek-harness:latest
+    # 必须和 dsh 服务用同一个镜像：插件装进 profile 时会按当时的宿主解析依赖，
+    # 两边版本不一致装出来的插件加载会失败。所以共用 DSH_IMAGE 这一个变量。
+    image: ${DSH_IMAGE:-smanx/deepseek-harness:0.1.5-rc.2}
     container_name: dsh-prod-init
     # one-shot：正常退出就别再拉起来，否则会和 dsh 反复抢同一个 profile 目录
     restart: "no"
@@ -206,7 +208,14 @@ services:
         max-file: "3"
 
   dsh:
-    image: smanx/deepseek-harness:latest
+    # 钉版本而不是用 latest。latest 会同时换掉三样东西：dsh 本体、镜像里那层
+    # node 代理、以及宿主对插件的 ABI 要求。实际踩过的坑：2026-09-09 的 latest
+    # 带上了 dsh 0.1.2 的 launch-token 认证，而配套的代理改动（自动用 token
+    # 换会话 cookie，见镜像内 /app/proxy/upstream-token.js）到 09-19 才发布 ——
+    # 中间那十天拉到的镜像，浏览器会停在
+    # 「dsh web authentication required; reopen the URL printed by dsh web」。
+    # 升级步骤见 README「升级」一节，要连插件一起刷。
+    image: ${DSH_IMAGE:-smanx/deepseek-harness:0.1.5-rc.2}
     container_name: dsh-prod
     restart: unless-stopped
 

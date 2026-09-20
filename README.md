@@ -258,14 +258,46 @@ pg0 关机时需要最多 30s 落盘 WAL（compose 里 `stop_grace_period` 已�
 
 备份包含 `caddy-data/` 里的 ACME 账号私钥，别放到公开的地方。
 
-### 更新镜像
+### 升级
+
+镜像版本由 `.env.prod` 里的 `DSH_IMAGE` 控制（不填就用 compose 里钉住的那个），
+`dsh` 和 `dsh-init` 共用同一个值。**升级不是 pull 一下就完了** —— 宿主升级后，
+profile 里的插件仍钉在第一次安装时解析出的版本上，`init-plugins.sh` 只按包名判重、
+不看版本，所以它永远不会自己刷新。
 
 ```bash
+# 1. 挑版本：https://hub.docker.com/r/smanx/deepseek-harness/tags
+vi .env.prod                       # 改 DSH_IMAGE
+
+# 2. 换镜像
 docker compose -f docker-compose.prod.yml --env-file .env.prod pull
 docker compose -f docker-compose.prod.yml --env-file .env.prod up -d
+
+# 3. 按新宿主重装插件（绕开判重，直接重新解析版本）
+docker compose -f docker-compose.prod.yml --env-file .env.prod run --rm \
+  --entrypoint sh dsh-init -c \
+  'corepack enable pnpm && dsh plugin --profile web add dshmarket@latest @vectorize-io/hindsight-coding-agents@latest'
+docker restart dsh-prod
+
+# 4. 确认镜像内那层代理认得新版的 token 认证
+docker exec dsh-prod ls /app/proxy | grep upstream-token.js
+docker logs dsh-prod | grep upstream-token
 ```
 
 数据在 `DATA_DIR` 里，容器重建不受影响。
+
+第 4 步在查什么：dsh 0.1.2 起 `dsh web` 加了浏览器会话认证 —— 启动时打印一个
+一次性 launch token，浏览器必须先访问 `/?token=...` 换一个签名 cookie（绑定
+请求的 Host、HttpOnly、SameSite=Strict、默认 30 天，签名密钥在
+`dsh-home/.credentials.yaml` 里，所以 cookie 能跨容器重启存活）。这一步没法关掉。
+镜像内的 `/app/proxy/upstream-token.js` 替你做了：根目录 GET 撞上 401 时，它从
+`/app/.dsh-web.log` 尾部捞出 token，剥掉浏览器的旧 cookie 带 token 重发一次，
+再把上游的 `Set-Cookie` 透传回去。所以正常情况下你什么都不用做。
+
+`ls /app/proxy` 里没有这个文件，说明镜像太旧（该修复 2026-09-19 才发布，而
+携带 token 认证的 dsh 0.1.2 在 09-09 就进了 `latest`，中间十天拉到的镜像是
+新 dsh + 旧代理的组合），换新版即可。真要手工兜底，代理还留了
+`DSH_TOKEN` / `DSH_TOKEN_FILE` 两个环境变量可以直接把 token 喂给它。
 
 ---
 
