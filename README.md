@@ -67,11 +67,13 @@ HTTP→HTTPS 跳转都走它。
 
 ### 2. 传文件
 
-服务器上只需要四个文件：
+服务器上只需要这几个文件：
 
 ```
 docker-compose.prod.yml
-Caddyfile
+Caddyfile                              ← 方案 B
+config/nginx-dsh.conf.example          ← 方案 A
+config/nginx-dsh-gate.conf.example     ← 方案 A
 config/init-plugins.sh
 .env.prod            ← 在服务器上从 .env.prod.example 复制后填写，不要从本地传
 ```
@@ -159,11 +161,36 @@ hindsight，没必要串行），两者都就绪后才起 `dsh`（等 hindsight 
 #### 方案 A：宿主已有 Nginx
 
 ```bash
+# 门禁密钥（说明见文件顶部）：一个随机 cookie 值 + 发给 dsh 的 Basic 头
+sudo cp config/nginx-dsh-gate.conf.example /etc/nginx/dsh-gate.conf
+sudo chmod 600 /etc/nginx/dsh-gate.conf
+sudo vi /etc/nginx/dsh-gate.conf
+
 sudo cp config/nginx-dsh.conf.example /etc/nginx/conf.d/dsh.conf
 sudo vi /etc/nginx/conf.d/dsh.conf        # 换成你的域名
 sudo nginx -t && sudo systemctl reload nginx
 sudo certbot --nginx -d <你的域名>         # 签证书并自动改写上面那个文件
 ```
+
+方案 A 的 Nginx 带一层 cookie 门禁：浏览器登录一次拿到 30 天的 `dsh_gate`
+cookie，之后由 Nginx 替它向 dsh 容器补 Basic 头。不加这层的话，iOS Safari
+每次打开都要重新输口令（而且常常弹两次）—— 它不持久保存 Basic 凭据，地址栏
+预载又会并发两个请求，各拿一个 401。门禁 cookie 带 `Secure`，所以 certbot
+签完证书之前走 http 会一直跳登录页，这是正常的。`/__dsh_logout` 退出登录；
+改 `dsh-gate.conf` 里的随机值能让所有设备立刻失效。
+
+`.env.prod` 的 `PROXY_USERNAME` / `PROXY_PASSWORD` 改了，`dsh-gate.conf` 里的
+Basic 头要同步改，否则门禁过了、dsh 那层拒绝，页面表现为一个裸的 401。
+
+**已经在跑旧版配置的机器**（certbot 改写过 `dsh.conf`，里面有 80 和 443 两个
+server 块）不要整份覆盖，否则证书配置会丢。按下面改：
+
+1. 生成 `/etc/nginx/dsh-gate.conf`，同上。
+2. 把新示例里 `server {` 之前的 `include` 和三个 `map` 复制到 `dsh.conf` 顶部。
+3. 在 **443 那个** server 块里，用新示例 server 块里 `absolute_redirect` 起到
+   末尾的全部内容（两个 `/__dsh_*`、manifest 那个、新的 `location /`）替换掉
+   原来的 `location / { ... }`。80 块是 certbot 写的跳转，不动。
+4. `sudo nginx -t && sudo systemctl reload nginx`，手机上重新登录一次。
 
 `nginx -t` 报 `unknown "connection_upgrade" variable` 是正常的第一次失败 ——
 WebSocket 需要的那段 `map` 必须放在 `nginx.conf` 的 `http` 块里，不能放在
@@ -186,11 +213,13 @@ docker compose -f docker-compose.prod.yml --env-file .env.prod ps
 docker logs dsh-prod-init          # 看插件装了没
 docker logs hindsight-prod         # 确认没有 permission denied
 docker logs -f caddy-prod          # 方案 B：等 certificate obtained successfully
-curl -I https://<你的域名>          # 期望 401
+curl -I https://<你的域名>          # 方案 A 期望 302 → /__dsh_login；方案 B 期望 401
 ```
 
-`401` 就是通的 —— 认证由 dsh 容器内的代理层做，Nginx / Caddy 都不叠第二层。
 浏览器打开会弹 Basic Auth 登录框，用 `PROXY_USERNAME` / `PROXY_PASSWORD` 登录。
+方案 B 的认证只由 dsh 容器内的代理层做，Caddy 不叠第二层，也没有 cookie 门禁
+（iOS 上会遇到上面说的反复登录）。方案 A 的登录框由 Nginx 门禁弹出，校验的是同
+一对口令。
 
 ---
 

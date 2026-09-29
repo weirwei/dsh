@@ -1,0 +1,27 @@
+# dsh cookie 门禁的密钥 —— 被 nginx-dsh.conf.example 顶部 include。
+#
+# 安装（只在服务器上生成，不要入库、不要 scp）：
+#   sudo cp config/nginx-dsh-gate.conf.example /etc/nginx/dsh-gate.conf
+#   sudo chmod 600 /etc/nginx/dsh-gate.conf      # master 进程以 root 读配置，600 够用
+#   openssl rand -hex 32                          # → 填到下面第一处
+#   printf '%s' "$PROXY_USERNAME:$PROXY_PASSWORD" | base64 -w0   # → 第二处（macOS 用 base64 不带 -w0）
+#
+# 第二处必须和 .env.prod 的 PROXY_USERNAME / PROXY_PASSWORD 一致：Nginx 登录页
+# 拿它校验你输入的口令，门禁放行后也拿它替浏览器向 dsh 容器补 Basic 头。
+# 改了 .env.prod 的口令，这里要一起改，然后 nginx -s reload。
+#
+# 换第一处 = 所有设备的门禁 cookie 立即作废、重新登录一次（没有按设备踢下线）。
+#
+# 用 map $host 而不是 set：map 定义在 http 级，校验用的 map 也能引用它，
+# 密钥只写一次。
+
+# 门禁 cookie 的值，必须是 64 位小写十六进制（校验正则按这个格式写死，
+# 格式不对等于门禁永远不放行，而不是永远放行）
+map $host $dsh_gate_secret {
+    default "REPLACE_WITH_openssl_rand_hex_32_OUTPUT_000000000000000000000000";
+}
+
+# "Basic " + base64(用户名:口令)
+map $host $dsh_upstream_auth {
+    default "Basic REPLACE_WITH_BASE64_OF_USER_COLON_PASS";
+}

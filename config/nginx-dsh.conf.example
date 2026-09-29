@@ -4,7 +4,8 @@
 # 安装：
 #   sudo cp config/nginx-dsh.conf.example /etc/nginx/conf.d/dsh.conf
 #   sudo vi /etc/nginx/conf.d/dsh.conf          # 把 dsh.example.com 换成你的域名
-#   # 先加下面那段 map 到 http 块（见「一次性前置」），再：
+#   # 先按 nginx-dsh-gate.conf.example 顶部说明生成 /etc/nginx/dsh-gate.conf，
+#   # 再加下面那段 map 到 http 块（见「一次性前置」），然后：
 #   sudo nginx -t && sudo systemctl reload nginx
 #   sudo certbot --nginx -d dsh.example.com     # 签证书，会自动改写本文件
 #
@@ -23,15 +24,97 @@
 #
 # 别的站点已经配过这个 map 的话不要重复加，nginx -t 会报 duplicate。
 # ============================================================
+#
+# ============================================================
+# cookie 门禁：登录一次，30 天内免输口令
+#
+# 为什么要有：dsh 容器内代理的 Basic Auth 每个请求都要凭据，而 iOS Safari
+# 进程被回收就忘掉 Basic 凭据，还会因为地址栏预载并发两个请求、弹两次框。
+# dsh 自己的 30 天会话 cookie 帮不上忙 —— 它排在 Basic 那层之后。
+#
+# 流程：
+#   无门禁 cookie → 302 到 /__dsh_login → 这里弹一次 Basic 框
+#   口令对 → 下发 dsh_gate=<密钥>（Secure; HttpOnly; SameSite=Lax; 30 天）→ 302 回 /
+#   此后每个请求（含 WebSocket）核对 cookie，对上了由 Nginx 替浏览器补上
+#   Authorization 发给 dsh 容器；容器那道 Basic Auth 仍在，只是不用人输了
+#
+# 退出登录：访问 /__dsh_logout。
+# Secure 属性意味着门禁只在 HTTPS 下工作 —— certbot 之前走 80 会一直跳登录页。
+# ============================================================
+
+# 密钥：$dsh_gate_secret、$dsh_upstream_auth。conf.d 下的文件本来就在 http 块内，
+# 所以 include 和下面的 map 放在 server 外面即可。
+include /etc/nginx/dsh-gate.conf;
+
+# cookie 是否等于密钥。拼成「cookie:密钥」再用反向引用比较，这样密钥只写一处；
+# 限定 64 位十六进制，cookie 缺失或密钥没填都不可能匹配（默认拒绝）。
+map "$cookie_dsh_gate:$dsh_gate_secret" $dsh_gate_ok {
+    default                    0;
+    "~^([0-9a-f]{64}):\1$"     1;
+}
+
+# 没过门禁时怎么处理：页面导航（Sec-Fetch-Dest: document，或老浏览器/curl
+# 不带这个头）跳登录页；fetch、WebSocket、静态资源回 401。
+map "$dsh_gate_ok:$http_sec_fetch_dest" $dsh_gate_action {
+    "~^1:"          pass;
+    "0:document"    login;
+    "0:"            login;
+    default         deny;
+}
+
+# 登录页上浏览器发来的 Basic 头是否正确。直接和发给上游的那个值比，
+# 省掉一份 htpasswd，口令只在 dsh-gate.conf 里存一份。
+map "$http_authorization|$dsh_upstream_auth" $dsh_login_ok {
+    default                                0;
+    "~^(Basic [A-Za-z0-9+/]+=*)\|\1$"      1;
+}
 
 server {
     listen 80;
     listen [::]:80;
     server_name dsh.example.com;
 
-    # certbot --nginx 会自己插入 301 跳转和 443 的 server 块。
-    # 在那之前保持 80 可用，ACME HTTP-01 挑战需要它。
+    # dsh 可以上传附件，默认 1m 太小
+    client_max_body_size 100m;
+
+    # 下面的 302 用相对 Location，不让 Nginx 拼出带内部端口/协议的绝对地址
+    absolute_redirect off;
+
+    # 登录：口令对就发门禁 cookie 并跳回首页，否则弹 Basic 框
+    location = /__dsh_login {
+        if ($dsh_login_ok = 0) {
+            add_header WWW-Authenticate 'Basic realm="dsh", charset="UTF-8"' always;
+            add_header Cache-Control "no-store" always;
+            return 401;
+        }
+        add_header Set-Cookie "dsh_gate=$dsh_gate_secret; Path=/; Max-Age=2592000; Secure; HttpOnly; SameSite=Lax" always;
+        add_header Cache-Control "no-store" always;
+        return 302 /;
+    }
+
+    location = /__dsh_logout {
+        add_header Set-Cookie "dsh_gate=; Path=/; Max-Age=0; Secure; HttpOnly; SameSite=Lax" always;
+        add_header Cache-Control "no-store" always;
+        return 302 /__dsh_login;
+    }
+
+    # PWA manifest 和图标：浏览器抓 manifest 时不带 cookie，门禁会把它挡成 302。
+    # 这几个路径 dsh 代理本身就免认证，内容只有应用名和图标。
+    location ~ ^/(manifest\.webmanifest|favicon\.(svg|ico))$ {
+        proxy_pass http://127.0.0.1:3080;
+        proxy_set_header Host $host;
+    }
+
     location / {
+        # 没过门禁：页面跳登录，其余请求（API、WS、静态资源）直接 401，
+        # 免得 fetch 跟随 302 拿到一页 HTML 当 JSON 解析
+        if ($dsh_gate_action = login) {
+            return 302 /__dsh_login;
+        }
+        if ($dsh_gate_action = deny) {
+            return 401;
+        }
+
         proxy_pass http://127.0.0.1:3080;
 
         proxy_http_version 1.1;
@@ -47,13 +130,16 @@ server {
         # 不要为了让按钮能用删掉这两行——那样 dsh 就拿不到真实客户端 IP 了。
         # 需要重启时用 docker restart dsh-prod，效果完全等价。
 
+        # 门禁已过：用 dsh-gate.conf 里的凭据替浏览器过 dsh 容器那道 Basic Auth。
+        # 覆盖而非透传浏览器的 Authorization，浏览器缓存的旧口令不会干扰。
+        proxy_set_header Authorization $dsh_upstream_auth;
+        # 凭据万一和 .env.prod 不一致，上游会回 401 + WWW-Authenticate，
+        # 浏览器就又弹框 —— 正是要消灭的现象。隐藏掉，让它表现为一个明确的 401。
+        proxy_hide_header WWW-Authenticate;
+
         # dsh 前端用 WebSocket 做实时通道，这三行缺一个都会让页面连上又断开
         proxy_set_header Upgrade    $http_upgrade;
         proxy_set_header Connection $connection_upgrade;
-
-        # 认证由 dsh 容器内的代理层做（PROXY_USERNAME / PROXY_PASSWORD），
-        # 这里不要再叠 auth_basic，同源两套 realm 只会让浏览器困惑。
-        # Authorization 头 Nginx 默认就会透传，不需要显式 proxy_set_header。
 
         # 长连接不要被提前掐断。默认 60s 会让 WebSocket 每分钟断一次，
         # 表现为「聊到一半就卡住 / 自动重连」。Nginx 不接受 0，给个大值。
@@ -62,8 +148,5 @@ server {
 
         # SSE / 流式输出不能被缓冲，否则模型输出会攒着一次性吐出来
         proxy_buffering off;
-
-        # dsh 可以上传附件，默认 1m 太小
-        client_max_body_size 100m;
     }
 }
