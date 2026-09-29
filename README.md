@@ -87,14 +87,15 @@ config/init-plugins.sh
 | `hindsight-data/` | pg0 数据库，记忆本体 | 最该备份 |
 | `dsh-home/` | 会话历史、已装插件、profile、`.credentials.yaml` | 高 |
 | `hindsight-agent/` | coding-agents 插件运行时状态 | 中 |
+| `session-workdir/` | 历史会话的工作目录，只为保住工作区分组 | 低 |
 | `caddy-data/` | TLS 证书与 ACME 账号私钥 | 中 |
 | `caddy-config/` | Caddy 自动保存的运行配置 | 低 |
 
 ```bash
 export D=/data/dsh     # 换成你的路径，有独立数据盘就指到盘上
-sudo mkdir -p $D/{hindsight-data,hindsight-agent,dsh-home,caddy-data,caddy-config}
+sudo mkdir -p $D/{hindsight-data,hindsight-agent,dsh-home,session-workdir,caddy-data,caddy-config}
 sudo chown -R 1000:1000 $D/hindsight-data
-sudo chown -R 0:0 $D/dsh-home $D/hindsight-agent $D/caddy-data $D/caddy-config
+sudo chown -R 0:0 $D/dsh-home $D/hindsight-agent $D/session-workdir $D/caddy-data $D/caddy-config
 sudo chmod 700 $D/dsh-home $D/caddy-data
 ```
 
@@ -269,9 +270,12 @@ profile 里的插件仍钉在第一次安装时解析出的版本上，`init-plu
 # 1. 挑版本：https://hub.docker.com/r/smanx/deepseek-harness/tags
 vi .env.prod                       # 改 DSH_IMAGE
 
-# 2. 换镜像
-docker compose -f docker-compose.prod.yml --env-file .env.prod pull
-docker compose -f docker-compose.prod.yml --env-file .env.prod up -d
+# 2. 换镜像。必须写服务名：裸 pull 会连 hindsight 一起拉，而
+#    ghcr.io/vectorize-io/hindsight:latest-slim 是移动 tag，等于顺带升级了
+#    记忆服务。那个镜像 450MB，国内小带宽机器实测跑到 79 分钟还没完，
+#    SSH 一断整个 pull 就废了 —— 所以也建议在 tmux 里跑。
+docker compose -f docker-compose.prod.yml --env-file .env.prod pull dsh dsh-init
+docker compose -f docker-compose.prod.yml --env-file .env.prod up -d dsh-init dsh
 
 # 3. 按新宿主重装插件（绕开判重，直接重新解析版本）
 docker compose -f docker-compose.prod.yml --env-file .env.prod run --rm \
@@ -347,6 +351,22 @@ docker restart dsh-prod
 `X-Real-IP` / `X-Forwarded-For`** —— 那会让 dsh 拿不到真实客户端 IP，也削弱了这个
 接口本来要防的东西（外部请求触发进程重启）。真想在 UI 里点，走 SSH 隧道从
 `http://127.0.0.1:3080` 访问，绕开反代就没有转发头了。
+
+**升级后工作区变空、会话全跑到「未分组」** — 会话一条没丢，是分组失效了。
+工作区分组不是存死的映射：`dsh-workspace` 在读取时按「会话 cwd 逐字等于工作区
+path」重新校验（`get sessionIds()` 里那个 filter），路径对不上就当没归属，前端
+把无归属会话统统塞进「未分组」。换镜像必然重建容器，而容器可写层里的目录会一起
+消失 —— 工作目录只要不在 `/root/.dsh`、`/root/.hindsight`、`/workspace` 这几个
+挂载点下就会踩到。
+
+```bash
+sudo grep -oE '"(path|title)": *"[^"]*"' $D/dsh-home/storages/workspace.json
+docker exec dsh-prod sh -c 'ls -ld <上面那个 path>'      # 不存在就是这个原因
+```
+
+把 `.env.prod` 里的 `SESSION_WORKDIR` 设成那个 path（逐字一致），重建 dsh 即可；
+`sessionIds` 记录没被删，路径一回来分组自动恢复。注意它只恢复分组，不恢复那个
+目录里原有的文件。以后在 `/workspace` 下开会话就不会再遇到。
 
 **改了配置没生效** — `dsh` 的端口从公网收回之后，`http://<IP>:3080` 不再可用，
 这是有意的（Basic Auth 密码明文过网）。要临时恢复，把 compose 里 dsh 的

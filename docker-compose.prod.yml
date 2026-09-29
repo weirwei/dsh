@@ -259,6 +259,16 @@ services:
       - ${DATA_DIR}/hindsight-agent:/root/.hindsight:z
       # 要让 dsh 操作的代码目录，必须是宿主上的绝对路径
       - ${WORKSPACE_DIR:?请在 .env.prod 中设置 WORKSPACE_DIR（宿主绝对路径）}:/workspace
+      # 历史会话的工作目录。会话的 cwd 写死在 session header 里，而工作区分组是
+      # 读取时按「会话 cwd 逐字等于工作区 path」重新校验的（dsh-workspace 里
+      # `get sessionIds()` 那个 filter）。这个路径在容器里不存在时，该工作区下
+      # 的会话会全部掉进「未分组」—— 容器重建会丢掉可写层，所以凡是不在挂载点
+      # 下的工作目录都会踩到。挂出来就能跨重建存活。
+      #
+      # SESSION_WORKDIR 必须逐字等于 dsh-home/storages/workspace.json 里的
+      # path 字段，差一个字符都对不上。默认值只是占位，不会修复任何已有分组。
+      # 注意：它只恢复分组，不恢复那个目录里原有的文件 —— 那些随旧容器一起没了。
+      - ${DATA_DIR}/session-workdir:${SESSION_WORKDIR:-/root/session-workdir}:z
 
     logging:
       driver: json-file
